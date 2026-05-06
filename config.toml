@@ -1,0 +1,32 @@
+# Исин — конфигурация
+
+[whisper]
+# Термины для улучшения распознавания whisper (initial_prompt).
+vocabulary = ["YouTrack", "JetBrains", "Jira", "Notion", "Slack"]
+
+# Фоллбэк-скилл: если ни один триггер не сработал — текст в буфер обмена.
+[[skill]]
+name = "clipboard"
+triggers = []
+action = "clipboard"
+
+# Пример: заметка в файл
+# [[skill]]
+# name = "note"
+# triggers = ["запиши", "заметка"]
+# params = [
+#   { name = "text", pattern = "(?:запиши|заметка) (.+)" }
+# ]
+# action = "file_append"
+# target = "~/notes/voice-notes.md"
+
+# Пример: задача в YouTrack
+# [[skill]]
+# name = "create_task"
+# triggers = ["создай задачу", "новая задача"]
+# params = [
+#   { name = "title", pattern = "(?:создай задачу|новая задача) (.+?)(?: в | на |$)" },
+#   { name = "project", pattern = "(?:в|на) (.+?)$", optional = true }
+# ]
+# action = "youtrack"
+# confirm = true

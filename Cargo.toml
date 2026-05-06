@@ -12,3 +12,5 @@ serde_json = "1"
 cpal = "0.15"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 rdev = "0.5"
+toml = "0.8"
+regex = "1"
