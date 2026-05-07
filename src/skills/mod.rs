@@ -1,4 +1,6 @@
 pub mod clipboard;
+pub mod file;
+pub mod reminder;
 
 use std::collections::HashMap;
 

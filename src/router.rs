@@ -3,63 +3,76 @@ use std::collections::HashMap;
 use regex::Regex;
 
 use crate::config::SkillDef;
+use crate::llm::OllamaClient;
 
 /// Результат матчинга текста против скилла.
+#[derive(Debug)]
 pub struct Match {
     /// Скилл, который matched.
     pub skill: SkillDef,
-    /// Извлечённые параметры.
-    pub params: HashMap<String, String>,
 }
 
-/// Пытается найти скилл, соответствующий тексту.
+/// Пытается найти скилл, соответствующий тексту по триггерам (regex).
 ///
-/// Перебирает скиллы по порядку, проверяет триггеры (regex).
-/// Первый matched скилл побеждает. Если ни один не matched —
-/// возвращается фоллбэк (скилл с пустыми triggers).
-pub fn match_skill<'a>(
-    text: &str,
-    skills: &'a [SkillDef],
-    fallback: Option<&'a SkillDef>,
-) -> Option<Match> {
+/// Перебирает скиллы по порядку. Первый matched скилл побеждает.
+/// Возвращает None если ни один триггер не сработал.
+pub fn match_skill(text: &str, skills: &[SkillDef]) -> Option<Match> {
     let text_lower = text.to_lowercase();
 
     for skill in skills {
-        // Фоллбэк-скилл пропускаем — он возвращается если никто не matched
         if skill.triggers.is_empty() {
             continue;
         }
 
         for trigger in &skill.triggers {
+            // TODO сделать Regex::new всех паттернов единожды на старте, для скорости.
             let Ok(re) = Regex::new(&format!("(?i){trigger}")) else {
                 continue;
             };
             if re.is_match(&text_lower) {
-                let params = extract_params(text, &skill.params);
                 return Some(Match {
                     skill: skill.clone(),
-                    params,
                 });
             }
         }
     }
 
-    // Никто не matched — фоллбэк
-    fallback.map(|skill| Match {
-        skill: skill.clone(),
-        params: HashMap::new(),
-    })
+    None
 }
 
-/// Извлекает параметры из текста по правилам из конфига.
-fn extract_params(text: &str, rules: &[crate::config::ParamRule]) -> HashMap<String, String> {
+/// Извлекает параметры из текста. Сначала через Ollama, потом regex fallback.
+pub async fn extract_params(
+    text: &str,
+    skill: &SkillDef,
+    ollama: &Option<OllamaClient>,
+) -> HashMap<String, String> {
+    if skill.params.is_empty() {
+        return HashMap::new();
+    }
+
+    // Ollama — приоритетный способ
+    if let Some(ref client) = ollama {
+        if let Some(params) = client.extract_params(text, &skill.params).await {
+            println!("Ollama extracted params {:?}", params);
+            return params;
+        }
+    }
+
+    // Fallback: regex по pattern
+    extract_params_regex(text, &skill.params)
+}
+
+/// Regex-извлечение параметров (fallback).
+fn extract_params_regex(text: &str, rules: &[crate::config::ParamRule]) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for rule in rules {
-        let Ok(re) = Regex::new(&rule.pattern) else {
+        let Some(ref pattern) = rule.pattern else {
+            continue;
+        };
+        let Ok(re) = Regex::new(pattern) else {
             continue;
         };
         if let Some(caps) = re.captures(text) {
-            // Берём первую capture group, либо весь матч
             let value = caps
                 .get(1)
                 .map(|m| m.as_str().trim().to_string())

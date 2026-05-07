@@ -7,6 +7,8 @@ use serde::Deserialize;
 pub struct Config {
     /// Настройки whisper: словарь терминов для улучшения распознавания.
     pub whisper: Option<WhisperConfig>,
+    /// Настройки Ollama для извлечения параметров.
+    pub ollama: Option<OllamaConfig>,
     /// Список скиллов.
     #[serde(default)]
     pub skill: Vec<SkillDef>,
@@ -18,6 +20,25 @@ pub struct WhisperConfig {
     /// Термины для initial_prompt (YouTrack, JetBrains, и т.д.).
     #[serde(default)]
     pub vocabulary: Vec<String>,
+}
+
+/// Настройки Ollama.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OllamaConfig {
+    /// URL Ollama API.
+    #[serde(default = "default_ollama_url")]
+    pub url: String,
+    /// Имя модели для извлечения параметров.
+    #[serde(default = "default_ollama_model")]
+    pub model: String,
+}
+
+fn default_ollama_url() -> String {
+    "http://localhost:11434".into()
+}
+
+fn default_ollama_model() -> String {
+    "qwen2.5:1.5b".into()
 }
 
 /// Описание одного скилла из конфига.
@@ -33,8 +54,10 @@ pub struct SkillDef {
     pub params: Vec<ParamRule>,
     /// Тип действия: clipboard, file_append, youtrack, shell, open.
     pub action: String,
-    /// Цель действия (путь к файлу, URL API, и т.д.).
+    /// Цель действия (путь к файлу/директории, URL API, и т.д.).
     pub target: Option<String>,
+    /// Шаблон имени файла для file_append ({{date}}, {{title}}, {{slug}}, {{time}}).
+    pub filename_template: Option<String>,
     /// Требовать подтверждение перед выполнением.
     #[serde(default)]
     pub confirm: bool,
@@ -45,8 +68,11 @@ pub struct SkillDef {
 pub struct ParamRule {
     /// Имя параметра.
     pub name: String,
-    /// Regex-паттерн для извлечения значения.
-    pub pattern: String,
+    /// Описание параметра для LLM (приоритетно).
+    pub description: Option<String>,
+    /// Regex-паттерн — fallback если Ollama недоступна.
+    #[serde(default)]
+    pub pattern: Option<String>,
     /// Параметр опциональный.
     #[serde(default)]
     pub optional: bool,
@@ -71,11 +97,6 @@ impl Config {
                 Some(w.vocabulary.join(" "))
             }
         })
-    }
-
-    /// Возвращает фоллбэк-скилл (пустые triggers).
-    pub fn fallback_skill(&self) -> Option<&SkillDef> {
-        self.skill.iter().find(|s| s.triggers.is_empty())
     }
 }
 
