@@ -155,11 +155,11 @@ async fn daemon_mode(
 
     // Инициализация Ollama
     let mut ollama = cfg.as_ref().and_then(|c| {
-        c.ollama.as_ref().map(|o| llm::OllamaClient::new(&o.url, &o.model))
+        c.ollama.as_ref().map(|o| llm::OllamaClient::new(&o.url, &o.model, o.auto_restart))
     });
 
     if let Some(ref mut client) = ollama {
-        if client.check_available().await {
+        if client.ensure_available().await {
             println!("Ollama подключена");
         } else {
             println!("Ollama недоступна — параметризация через regex");

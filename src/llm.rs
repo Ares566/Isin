@@ -5,12 +5,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ParamRule, SkillDef};
 
-/// Клиент для Ollama API. Используется для извлечения параметров и intent recognition.
+const MAX_RETRIES: u32 = 3;
+const BASE_DELAY: Duration = Duration::from_secs(1);
+
+/// Клиент для Ollama API.
 pub struct OllamaClient {
     url: String,
     model: String,
     client: reqwest::Client,
     available: bool,
+    auto_restart: bool,
 }
 
 /// Запрос к Ollama API.
@@ -29,7 +33,7 @@ struct OllamaOptions {
     num_predict: Option<u32>,
 }
 
-/// Ответ Ollama API.
+/// Ответ Ollama API (поле response).
 #[derive(Deserialize)]
 struct OllamaResponse {
     response: String,
@@ -46,8 +50,8 @@ pub struct IntentMatch {
 }
 
 impl OllamaClient {
-    /// Создаёт клиент с заданным URL и моделью.
-    pub fn new(url: &str, model: &str) -> Self {
+    /// Создаёт клиент с заданным URL, моделью и флагом авторестарта.
+    pub fn new(url: &str, model: &str, auto_restart: bool) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -57,21 +61,214 @@ impl OllamaClient {
             model: model.to_string(),
             client,
             available: true,
+            auto_restart,
         }
     }
 
-    /// Проверяет доступность Ollama.
-    pub async fn check_available(&mut self) -> bool {
-        let url = format!("{}/api/tags", self.url);
-        match self.client.get(&url).send().await {
-            Ok(resp) => {
-                self.available = resp.status().is_success();
-            }
-            Err(_) => {
+    /// Проверяет доступность Ollama: ping + тестовый запрос к модели.
+    /// Если модель не отвечает и auto_restart=true — перезапускает Ollama.
+    pub async fn ensure_available(&mut self) -> bool {
+        // 1. Ping: доступен ли сервер?
+        let ping_ok = self.ping().await;
+        if !ping_ok {
+            if self.auto_restart {
+                println!("  [llm] Ollama не отвечает, перезапуск...");
+                if self.restart_ollama().await {
+                    self.available = self.health_check().await;
+                } else {
+                    self.available = false;
+                }
+            } else {
                 self.available = false;
             }
+            return self.available;
         }
+
+        // 2. Deep check: может ли модель генерировать?
+        self.available = self.health_check().await;
+        if !self.available && self.auto_restart {
+            println!("  [llm] Ollama модель не работает, перезапуск...");
+            if self.restart_ollama().await {
+                self.available = self.health_check().await;
+            }
+        }
+
         self.available
+    }
+
+    /// Проверяет что сервер отвечает на /api/tags.
+    async fn ping(&self) -> bool {
+        let url = format!("{}/api/tags", self.url);
+        match self.client.get(&url).send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
+    /// Тестовый запрос к модели: генерация 1 токена.
+    async fn health_check(&self) -> bool {
+        let request = OllamaRequest {
+            model: self.model.clone(),
+            prompt: "ok".into(),
+            stream: false,
+            options: OllamaOptions {
+                temperature: 0.1,
+                num_predict: Some(1),
+            },
+        };
+
+        let url = format!("{}/api/generate", self.url);
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.client.post(&url).json(&request).send(),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                if let Ok(raw) = resp.text().await {
+                    // Проверяем что нет ошибки
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        if val.get("error").is_some() {
+                            eprintln!("  [llm] health_check: модель вернула ошибку: {}", &raw[..raw.len().min(200)]);
+                            return false;
+                        }
+                    }
+                    // Есть поле response — значит модель работает
+                    raw.contains("\"response\"")
+                } else {
+                    false
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("  [llm] health_check: HTTP ошибка: {e}");
+                false
+            }
+            Err(_) => {
+                eprintln!("  [llm] health_check: таймаут 30с");
+                false
+            }
+        }
+    }
+
+    /// Перезапускает Ollama: kill → wait → serve.
+    async fn restart_ollama(&self) -> bool {
+        // Убиваем существующий процесс
+        let _ = std::process::Command::new("pkill")
+            .arg("ollama")
+            .output();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Запускаем в фоне
+        match std::process::Command::new("ollama")
+            .arg("serve")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => {
+                println!("  [llm] Ollama запускается...");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                // Проверяем что поднялась
+                self.ping().await
+            }
+            Err(e) => {
+                eprintln!("  [llm] не удалось запустить Ollama: {e}");
+                false
+            }
+        }
+    }
+
+    /// Отправляет prompt к /api/generate с ретраями (3 попытки, экспоненциальная задержка).
+    /// Возвращает очищенный от markdown-обёрток текст ответа.
+    async fn generate(&self, prompt: &str, num_predict: u32) -> Option<String> {
+        let request = OllamaRequest {
+            model: self.model.clone(),
+            prompt: prompt.to_string(),
+            stream: false,
+            options: OllamaOptions {
+                temperature: 0.1,
+                num_predict: Some(num_predict),
+            },
+        };
+
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                let delay = BASE_DELAY * 2u32.pow(attempt - 1);
+                eprintln!(
+                    "  [llm] ретрай {}/{} через {:.1}с",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    delay.as_secs_f64()
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            let url = format!("{}/api/generate", self.url);
+            let t = std::time::Instant::now();
+
+            let resp = match tokio::time::timeout(
+                Duration::from_secs(15),
+                self.client.post(&url).json(&request).send(),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    eprintln!("  [llm] ошибка HTTP: {e}");
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("  [llm] таймаут 15с");
+                    continue;
+                }
+            };
+
+            eprintln!("  [llm] HTTP за {:.1}с", t.elapsed().as_secs_f64());
+
+            // Читаем body как текст для диагностики
+            let raw = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("  [llm] ошибка чтения body: {e}");
+                    continue;
+                }
+            };
+
+            eprintln!("  [llm] raw: {}", &raw[..raw.len().min(500)]);
+
+            // Проверяем ошибку Ollama {"error": "..."}
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
+                    eprintln!("  [llm] Ollama error: {err}");
+                    continue;
+                }
+            }
+
+            let body: OllamaResponse = match serde_json::from_str(&raw) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("  [llm] ошибка JSON: {e}");
+                    continue;
+                }
+            };
+
+            let content = body.response.trim();
+            let cleaned = content
+                .trim_start_matches("```json")
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim();
+
+            eprintln!(
+                "  [llm] ответ за {:.1}с: {content}",
+                t.elapsed().as_secs_f64()
+            );
+
+            return Some(cleaned.to_string());
+        }
+
+        eprintln!("  [llm] все {} попытки исчерпаны", MAX_RETRIES);
+        None
     }
 
     /// Извлекает параметры из текста через Ollama.
@@ -111,49 +308,14 @@ impl OllamaClient {
                 .join(", ")
         );
 
-        let request = OllamaRequest {
-            model: self.model.clone(),
-            prompt,
-            stream: false,
-            options: OllamaOptions { temperature: 0.1, num_predict: Some(200) },
-        };
+        let json_str = self.generate(&prompt, 200).await?;
 
-        eprintln!("  [llm] extract_params: отправка запроса...");
-        let t = std::time::Instant::now();
-
-        let url = format!("{}/api/generate", self.url);
-        let resp = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.client.post(&url).json(&request).send(),
-        )
-        .await
-        .map_err(|_| {
-            eprintln!("  [llm] extract_params: таймаут 15с");
-        })
-        .ok()?
-        .map_err(|e| {
-            eprintln!("  [llm] extract_params: ошибка запроса: {e}");
-        })
-        .ok()?;
-
-        eprintln!("  [llm] extract_params: HTTP ответ за {:.1}с, читаем body...", t.elapsed().as_secs_f64());
-
-        let body: OllamaResponse = resp.json().await.map_err(|e| {
-            eprintln!("  [llm] extract_params: ошибка парсинга body: {e}");
-        }).ok()?;
-
-        eprintln!("  [llm] extract_params: ответ за {:.1}с: {}", t.elapsed().as_secs_f64(), body.response.trim());
-
-        let content = body.response.trim();
-        let json_str = content
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-
-        let result: HashMap<String, String> = serde_json::from_str(json_str).map_err(|e| {
-            eprintln!("  [llm] extract_params: ошибка JSON: {e}, raw: {json_str}");
-        }).ok()?;
+        let result: HashMap<String, String> =
+            serde_json::from_str(&json_str)
+                .map_err(|e| {
+                    eprintln!("  [llm] extract_params: ошибка JSON: {e}, raw: {json_str}");
+                })
+                .ok()?;
 
         Some(result)
     }
@@ -202,56 +364,27 @@ impl OllamaClient {
             skills = skills_desc.join("\n"),
         );
 
-        let request = OllamaRequest {
-            model: self.model.clone(),
-            prompt,
-            stream: false,
-            options: OllamaOptions { temperature: 0.1, num_predict: Some(200) },
-        };
+        let json_str = self.generate(&prompt, 200).await?;
 
-        eprintln!("  [llm] match_skill: отправка запроса...");
-        let t = std::time::Instant::now();
-
-        let url = format!("{}/api/generate", self.url);
-        let resp = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.client.post(&url).json(&request).send(),
-        )
-        .await
-        .map_err(|_| {
-            eprintln!("  [llm] match_skill: таймаут 15с");
-        })
-        .ok()?
-        .map_err(|e| {
-            eprintln!("  [llm] match_skill: ошибка запроса: {e}");
-        })
-        .ok()?;
-
-        eprintln!("  [llm] match_skill: HTTP ответ за {:.1}с, читаем body...", t.elapsed().as_secs_f64());
-
-        let body: OllamaResponse = resp.json().await.map_err(|e| {
-            eprintln!("  [llm] match_skill: ошибка парсинга body: {e}");
-        }).ok()?;
-
-        eprintln!("  [llm] match_skill: ответ за {:.1}с: {}", t.elapsed().as_secs_f64(), body.response.trim());
-
-        let content = body.response.trim();
-        let json_str = content
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-
-        let mut intent: IntentMatch = serde_json::from_str(json_str).map_err(|e| {
-            eprintln!("  [llm] match_skill: ошибка JSON: {e}, raw: {json_str}");
-        }).ok()?;
+        let mut intent: IntentMatch =
+            serde_json::from_str(&json_str)
+                .map_err(|e| {
+                    eprintln!("  [llm] match_skill: ошибка JSON: {e}, raw: {json_str}");
+                })
+                .ok()?;
 
         // Ollama может вернуть name или action — нормализуем к action
-        if let Some(matched) = skills.iter().find(|s| s.name == intent.skill || s.action == intent.skill) {
+        if let Some(matched) = skills
+            .iter()
+            .find(|s| s.name == intent.skill || s.action == intent.skill)
+        {
             intent.skill = matched.action.clone();
             Some(intent)
         } else {
-            eprintln!("  [llm] match_skill: неизвестный скилл '{}', фоллбэк в clipboard", intent.skill);
+            eprintln!(
+                "  [llm] match_skill: неизвестный скилл '{}', фоллбэк в clipboard",
+                intent.skill
+            );
             Some(IntentMatch {
                 skill: "clipboard".into(),
                 params: HashMap::new(),

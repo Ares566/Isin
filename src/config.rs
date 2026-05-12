@@ -31,6 +31,13 @@ pub struct OllamaConfig {
     /// Имя модели для извлечения параметров.
     #[serde(default = "default_ollama_model")]
     pub model: String,
+    /// Автоматически перезапускать Ollama при сбое.
+    #[serde(default = "default_auto_restart")]
+    pub auto_restart: bool,
+}
+
+fn default_auto_restart() -> bool {
+    true
 }
 
 fn default_ollama_url() -> String {
