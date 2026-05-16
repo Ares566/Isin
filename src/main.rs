@@ -12,6 +12,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::Parser;
+use skills::claude::ClaudeSkill;
 use skills::clipboard::ClipboardSkill;
 use skills::file::FileAppendSkill;
 use skills::reminder::ReminderSkill;
@@ -168,6 +169,7 @@ async fn daemon_mode(
 
     // Реестр скиллов
     let mut registry = SkillRegistry::new();
+    registry.register(Box::new(ClaudeSkill));
     registry.register(Box::new(ClipboardSkill));
     registry.register(Box::new(FileAppendSkill));
     registry.register(Box::new(ReminderSkill));

@@ -9,6 +9,8 @@ vocabulary = ["YouTrack", "JetBrains", "Jira", "Notion", "Slack"]
 url = "http://localhost:11434"
 # Модель для извлечения параметров
 model = "qwen2.5:1.5b"
+# Автоматически перезапускать Ollama при сбое
+auto_restart = true
 
 # Фоллбэк-скилл: если ни один триггер не сработал — текст в буфер обмена.
 [[skill]]
@@ -39,3 +41,13 @@ params = [
 ]
 action = "reminder"
 target = "~/Documents/WB/AINotes/reminders.md"
+
+# Вопрос Claude
+[[skill]]
+name = "ask_claude"
+triggers = ["спроси у клод(а|а)", "задай вопрос клод(у|а)"]
+params = [
+  { name = "query", description = "вопрос или задача для Claude" }
+]
+action = "claude"
+target = "~/Documents/WB/AINotes/claude"
