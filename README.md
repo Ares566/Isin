@@ -1,157 +1,178 @@
 # Исин — голосовой ассистент для macOS
 
-**Исин** — CLI-демон для macOS (Apple Silicon), который слушает горячую клавишу, записывает речь, транскрибирует локально через Whisper и выполняет действия через настраиваемую систему скиллов. Всё работает локально, без облака.
+**Исин** — CLI-демон для macOS (Apple Silicon). Нажимаешь `Cmd+Shift+Space`, говоришь фразу — она распознаётся локально через Whisper и выполняется через настраиваемую систему скиллов. Всё работает на устройстве, без облака.
 
 Заточен под русский язык.
+
+## Возможности
+
+- **Голос → текст** — локальная транскрибация через whisper-rs (ggml-large-v3)
+- **Роутер скиллов** — regex-триггеры + fallback на Ollama для intent recognition
+- **Извлечение параметров** — Ollama (приоритет) или regex-fallback
+- **Настраиваемые скиллы** через TOML-конфиг
+- **Интеграция с Claude** — «спроси у Клода» отправляет вопрос локальному Claude CLI
+
+### Скиллы из коробки
+
+| Скилл | Триггер | Действие |
+|---|---|---|
+| `clipboard` | фоллбэк (нет триггера) | текст в буфер обмена |
+| `file_append` | «создай заметку» | MD-файл в указанной директории |
+| `reminder` | «напомни» | задача в obsidian-reminder формате |
+| `claude` | «спроси у клода» | вопрос → Claude CLI → ответ в MD-файл + уведомление |
 
 ## Архитектура
 
 ```
-горячая клавиша → запись с микрофона → транскрибация (whisper-rs)
-                                              ↓
-                                         роутер (pattern matching)
-                                         ↙              ↘
-                                   matched               fallback
-                                      ↓                     ↓
-                                extract params         LLM API (опционально)
-                                      ↓                  ↓
-                                execute skill      intent → skill
-                                      ↓
-                                результат (уведомление / тихо)
+Cmd+Shift+Space
+       ↓
+  запись с микрофона (cpal, 16kHz mono)
+       ↓
+  транскрибация (whisper-rs, локально)
+       ↓
+  роутер
+  ├── regex-триггеры из config.toml
+  └── Ollama intent recognition (fallback)
+       ↓
+  извлечение параметров (Ollama → regex fallback)
+       ↓
+  execute skill → результат
 ```
 
-## Система скиллов
+## Быстрый старт
 
-Скиллы описываются в `config.toml`. Каждый скилл имеет триггерные фразы, правила извлечения параметров и тип действия.
+```bash
+# Клонируем
+git clone https://github.com/Ares566/Isin.git
+cd Isin
 
-Пример конфигурации:
+# Установка зависимостей, сборка, запуск
+bash install.sh
+```
+
+`install.sh` установит всё необходимое: Rust, ffmpeg, Ollama, скачает модели Whisper и Qwen, соберёт бинарник.
+
+После установки:
+
+```bash
+./target/release/isin
+```
+
+Нажми `Cmd+Shift+Space`, скажи фразу, отпусти — Исин распознает и выполнит действие.
+
+## Конфигурация
+
+Файл `config.toml` создаётся автоматически при первом запуске `install.sh`.
 
 ```toml
-[[skill]]
-name = "create_task"
-triggers = ["создай задачу", "новая задача"]
-params = [
-  { name = "title", pattern = "(?:создай задачу|новая задача) (.+?)(?: в |$)" },
-  { name = "project", pattern = "в (.+?)$", optional = true }
-]
-action = "youtrack"
-confirm = true
+[whisper]
+vocabulary = ["YouTrack", "JetBrains", "Jira"]
 
-[[skill]]
-name = "note"
-triggers = ["запиши", "заметка"]
-params = [
-  { name = "text", pattern = "(?:запиши|заметка) (.+)" }
-]
-action = "file_append"
-target = "~/notes/voice-notes.md"
+[ollama]
+url = "http://localhost:11434"
+model = "qwen2.5:1.5b"
+auto_restart = true
 
+# Фоллбэк — текст в буфер обмена
 [[skill]]
 name = "clipboard"
-triggers = []          # пусто = скилл по умолчанию (фоллбэк)
-action = "clipboard"   # просто вставить текст в буфер обмена
+triggers = []
+action = "clipboard"
+
+# Заметка в файл
+[[skill]]
+name = "note"
+triggers = ["(создать|создай|запиши|сделай|добавь) заметку"]
+params = [
+  { name = "title", description = "заголовок заметки" },
+  { name = "text", description = "текст заметки" }
+]
+action = "file_append"
+target = "~/Documents/WB/AINotes"
+filename_template = "{{date}}-{{slug}}.md"
+
+# Напоминание (obsidian-reminder формат)
+[[skill]]
+name = "reminder"
+triggers = ["напомни", "поставь напоминание"]
+params = [
+  { name = "task", description = "о чём напомнить" },
+  { name = "date", description = "дата, формат YYYY-MM-DD" },
+  { name = "time", description = "время, формат HH:MM", optional = true }
+]
+action = "reminder"
+target = "~/Documents/WB/AINotes/reminders.md"
+
+# Вопрос Claude (нужен установленный Claude CLI)
+[[skill]]
+name = "ask_claude"
+triggers = ["спроси у клод(а|а)", "задай вопрос клод(у|а)"]
+params = [
+  { name = "query", description = "вопрос или задача для Claude" }
+]
+action = "claude"
+target = "~/Documents/WB/AINotes/claude"
+```
+
+## CLI
+
+```
+isin [OPTIONS]
+
+Опции:
+  -f, --file <PATH>        Транскрибация аудиофайла (вместо демона)
+  -m, --model <PATH>       Путь к модели Whisper [default: ggml-large-v3.bin]
+  -l, --language <LANG>    Язык распознавания [default: ru]
+  -o, --output <PATH>      Выходной MD-файл (только для --file)
+  -c, --config <PATH>      Путь к конфигу [default: config.toml]
+      --silence-stop <SEC>  Секунд тишины до остановки [default: 3]
+      --min-speech <SEC>    Минимальная длительность речи [default: 3]
+      --list-devices        Показать микрофоны и выйти
 ```
 
 ## Структура проекта
 
 ```
 src/
-├── main.rs          # точка входа, цикл демона (hotkey loop)
-├── audio.rs         # захват звука с микрофона (cpal)
-├── transcriber.rs   # транскрибация через whisper-rs
-├── router.rs        # матчинг текста → скилл
-├── skills/
-│   ├── mod.rs       # trait Skill + реестр скиллов
-│   ├── clipboard.rs # фоллбэк — текст в буфер
-│   ├── youtrack.rs  # API-вызовы YouTrack
-│   ├── file.rs      # запись в файл
-│   └── shell.rs     # запуск shell-команды
+├── main.rs          # точка входа, daemon loop + file mode
+├── audio.rs         # захват с микрофона (cpal) + декодинг файлов (ffmpeg)
+├── transcriber.rs   # whisper-rs обёртка
+├── router.rs        # regex-матчинг текста → скилл
+├── llm.rs           # Ollama клиент (extract_params, match_skill, retry)
 ├── config.rs        # парсинг TOML-конфига
-└── llm.rs           # обёртка над LLM API (опционально, позже)
-```
-
-## Trait Skill
-
-```rust
-trait Skill {
-    fn matches(&self, text: &str) -> bool;
-    fn extract_params(&self, text: &str) -> HashMap<String, String>;
-    fn execute(&self, params: HashMap<String, String>) -> Result<String>;
-    fn confirm_prompt(&self, params: &HashMap<String, String>) -> Option<String>;
-}
-```
-
-## Шаги реализации
-
-### Шаг 1: Базовая транскрибация (уже работает)
-- [x] whisper-rs транскрибация аудиофайлов в текст
-- [x] CLI-интерфейс для обработки файлов
-
-### Шаг 2: Захват с микрофона + хоткей
-- [ ] Модуль `audio.rs` — запись с микрофона через cpal (16kHz mono)
-- [ ] Детекция тишины (стоп по паузе в речи)
-- [ ] Глобальный хоткей через CGEventTap (macOS)
-- [ ] Основной цикл демона: хоткей → запись → транскрибация → вывод в консоль
-
-### Шаг 3: Роутер и система скиллов
-- [ ] Парсинг `config.toml` со списком скиллов
-- [ ] `router.rs` — pattern matching по триггерным фразам (regex)
-- [ ] Извлечение параметров из текста по правилам из конфига
-- [ ] `trait Skill` + реестр скиллов
-- [ ] Скилл-фоллбэк: текст в буфер обмена
-
-### Шаг 4: Базовые скиллы
-- [ ] `clipboard` — текст в буфер обмена + автопаст
-- [ ] `file_append` — дописать текст в файл
-- [ ] `shell` — выполнить shell-команду
-- [ ] `open` — открыть файл/URL
-- [ ] Подтверждение перед выполнением (опционально)
-
-### Шаг 5: LLM-обёртка (опционально)
-- [ ] Интеграция с Claude API / Ollama
-- [ ] Фоллбэк на LLM если pattern matching не сработал
-- [ ] Использование контекста сессии в промптах
-- [ ] Извлечение intent через LLM для сложных команд
-
-### Шаг 6: Интеграции (по необходимости)
-- [ ] YouTrack — создание/поиск задач
-- [ ] Notion — создание заметок
-- [ ] Другие API через настраиваемые скиллы
-
-## Зависимости
-
-```toml
-whisper-rs = "0.16"    # транскрибация (whisper.cpp bindings)
-cpal = "0.15"          # захват звука с микрофона
-tokio = "1"            # async runtime
-serde = "1"            # сериализация
-serde_json = "1"       # JSON парсинг
-toml = "0.8"           # конфигурация
-regex = "1"            # pattern matching для триггеров
-reqwest = "0.12"       # HTTP-клиент (для LLM и API-скиллов)
-clap = "4"             # CLI аргументы
-core-graphics = "0.24" # глобальный хоткей (macOS)
+├── hotkey.rs        # глобальный хоткей (rdev)
+├── formatter.rs     # Markdown-форматирование (для --file)
+└── skills/
+    ├── mod.rs       # trait Skill + SkillRegistry
+    ├── clipboard.rs # текст в буфер обмена (pbcopy)
+    ├── file.rs      # file_append: создаёт/дополняет MD-файл
+    ├── reminder.rs  # obsidian-reminder формат
+    └── claude.rs    # вопрос → Claude CLI → ответ в файл
 ```
 
 ## Требования
 
 - macOS с Apple Silicon (M1/M2/M3/M4)
 - Rust 1.75+
-- Whisper модель (ggml-large-v3.bin)
-- Для LLM: API-ключ Claude или запущенный Ollama
+- Whisper модель `ggml-large-v3.bin` (~3GB)
+- Ollama с моделью `qwen2.5:1.5b` (для параметризации)
+- Claude CLI (опционально, для скилла «спроси у Клода»)
 
-## Запуск
+## Добавление своего скилла
 
-```bash
-# Сборка
-cargo build --release
+1. Создай файл `src/skills/my_skill.rs` с реализацией `trait Skill`
+2. Зарегистрируй в `src/main.rs`: `registry.register(Box::new(MySkill))`
+3. Опиши в `config.toml`:
 
-# Запуск демона
-./target/release/isin
-
-# С указанием конфига
-./target/release/isin --config path/to/config.toml
-
-# Тестовая транскрибация файла
-./target/release/isin --file audio.mp3
+```toml
+[[skill]]
+name = "my_skill"
+triggers = ["мой триггер"]
+params = [{ name = "param1", description = "описание параметра" }]
+action = "my_skill"
+target = "..."
 ```
+
+## Лицензия
+
+MIT

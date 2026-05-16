@@ -1,0 +1,53 @@
+# Исин — конфигурация
+
+[whisper]
+# Термины для улучшения распознавания whisper (initial_prompt).
+vocabulary = ["YouTrack", "JetBrains", "Jira", "Notion", "Slack"]
+
+[ollama]
+# URL Ollama API (по умолчанию http://localhost:11434)
+url = "http://localhost:11434"
+# Модель для извлечения параметров
+model = "qwen2.5:1.5b"
+# Автоматически перезапускать Ollama при сбое
+auto_restart = true
+
+# Фоллбэк-скилл: если ни один триггер не сработал — текст в буфер обмена.
+[[skill]]
+name = "clipboard"
+triggers = []
+action = "clipboard"
+
+# Заметка в файл
+[[skill]]
+name = "note"
+triggers = ["(создать|создай|запиши|сделай|добавь) заметку"]
+params = [
+  { name = "title", description = "тайтл или заголовок заметки" },
+  { name = "text", description = "текст или содержимое заметки" }
+]
+action = "file_append"
+target = "~/Documents/WB/AINotes"
+filename_template = "{{date}}-{{slug}}.md"
+
+# Напоминание (obsidian-reminder формат)
+[[skill]]
+name = "reminder"
+triggers = ["напомни", "поставь напоминание", "напомни мне"]
+params = [
+  { name = "task", description = "о чём напомнить, описание задачи" },
+  { name = "date", description = "дата напоминания, формат YYYY-MM-DD" },
+  { name = "time", description = "время напоминания, формат HH:MM", optional = true }
+]
+action = "reminder"
+target = "~/Documents/WB/AINotes/reminders.md"
+
+# Вопрос Claude
+[[skill]]
+name = "ask_claude"
+triggers = ["спроси у клод(а|а)", "задай вопрос клод(у|а)"]
+params = [
+  { name = "query", description = "вопрос или задача для Claude" }
+]
+action = "claude"
+target = "~/Documents/WB/AINotes/claude"
