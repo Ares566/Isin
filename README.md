@@ -1,117 +1,69 @@
-# Исин — голосовой ассистент для macOS
+# Исин — голосовой ввод для macOS
 
-**Исин** — CLI-демон для macOS (Apple Silicon). Нажимаешь `Cmd+Shift+Space`, говоришь фразу — она распознаётся локально через Whisper и выполняется через настраиваемую систему скиллов. Всё работает на устройстве, без облака.
+**Исин** — CLI-демон для macOS (Apple Silicon). Удерживаешь `Fn`, говоришь фразу, отпускаешь — речь распознаётся локально через Whisper, выводится в консоль, копируется в буфер обмена и вставляется в активное поле ввода. Никакие скиллы или внешние LLM не вызываются.
 
 Заточен под русский язык.
 
 ## Возможности
 
+- **Push-to-talk через Fn** — запись длится, пока удерживается клавиша
+- **Иконка в строке меню** — серая в ожидании, красная во время записи, пульсирующая жёлтая во время распознавания и зелёная после успеха
 - **Голос → текст** — локальная транскрибация через whisper-rs (ggml-large-v3)
-- **Роутер скиллов** — regex-триггеры + fallback на Ollama для intent recognition
-- **Извлечение параметров** — Ollama (приоритет) или regex-fallback
-- **Настраиваемые скиллы** через TOML-конфиг
-- **Интеграция с Claude** — «спроси у Клода» отправляет вопрос локальному Claude CLI
+- **Консоль + буфер обмена + автовставка** — распознанный текст сразу вставляется в активное поле и остаётся в буфере
+- **Системное уведомление со звуком** — сообщает о завершении распознавания и копировании
+- **Словарь терминов** — настраиваемый initial_prompt для Whisper
+- **Транскрибация файлов** — отдельный CLI-режим с сохранением в Markdown
 
-### Скиллы из коробки
-
-| Скилл | Триггер | Действие |
-|---|---|---|
-| `clipboard` | фоллбэк (нет триггера) | текст в буфер обмена |
-| `file_append` | «создай заметку» | MD-файл в указанной директории |
-| `reminder` | «напомни» | задача в obsidian-reminder формате |
-| `claude` | «спроси у клода» | вопрос → Claude CLI → ответ в MD-файл + уведомление |
-
-## Архитектура
+## Схема работы
 
 ```
-Cmd+Shift+Space
-       ↓
-  запись с микрофона (cpal, 16kHz mono)
-       ↓
-  транскрибация (whisper-rs, локально)
-       ↓
-  роутер
-  ├── regex-триггеры из config.toml
-  └── Ollama intent recognition (fallback)
-       ↓
-  извлечение параметров (Ollama → regex fallback)
-       ↓
-  execute skill → результат
+Удержание Fn → красная иконка
+      ↓
+Запись с микрофона (cpal, 16kHz mono)
+      ↓
+Отпускание Fn → пульсирующая жёлтая иконка
+      ↓
+Локальная транскрибация (whisper-rs)
+      ↓
+Зелёная иконка + консоль + буфер обмена + вставка через Cmd+V
 ```
 
-## Быстрый старт
+## Установка с GitHub
+
+Нужны macOS на Apple Silicon и [Homebrew](https://brew.sh). Затем:
 
 ```bash
-# Клонируем
 git clone https://github.com/Ares566/Isin.git
 cd Isin
-
-# Установка зависимостей, сборка, запуск
-bash install.sh
+./install.sh
 ```
 
-`install.sh` установит всё необходимое: Rust, ffmpeg, Ollama, скачает модели Whisper и Qwen, соберёт бинарник.
+Скрипт проверит Xcode Command Line Tools, установит `cmake`, `pkg-config`, `ffmpeg` и Rust, скачает модель Whisper (~3GB), соберёт приложение и установит команду `isin` в `~/.local/bin`. Если этот каталог отсутствует в `PATH`, установщик покажет нужную команду.
 
-После установки:
+Повторный запуск `./install.sh` безопасен: существующие модель и конфигурация сохраняются. Для обновления до новой версии:
 
 ```bash
-./target/release/isin
+git pull
+./install.sh
 ```
 
-Нажми `Cmd+Shift+Space`, скажи фразу, отпусти — Исин распознает и выполнит действие.
+## Запуск
+
+```bash
+isin
+```
+
+Переведи фокус в нужное поле ввода, удерживай `Fn`, скажи фразу и отпусти клавишу. После распознавания текст автоматически вставится через `Cmd+V` и сохранится в буфере обмена. Если автовставка недоступна, текст всё равно будет скопирован.
+
+Для глобального перехвата Fn разреши терминалу доступ в настройках macOS: **Конфиденциальность и безопасность → Мониторинг ввода**. Для автовставки также нужен **Конфиденциальность и безопасность → Универсальный доступ**. Кроме того, нужны разрешения на использование микрофона и показ уведомлений.
 
 ## Конфигурация
 
-Файл `config.toml` создаётся автоматически при первом запуске `install.sh`.
+Установщик создаёт `~/.config/isin/config.toml`, а модель сохраняет в `~/.local/share/isin/ggml-large-v3.bin`. Существующий конфиг при повторной установке не перезаписывается. Сейчас настраивается только словарь Whisper:
 
 ```toml
 [whisper]
 vocabulary = ["YouTrack", "JetBrains", "Jira"]
-
-[ollama]
-url = "http://localhost:11434"
-model = "qwen2.5:1.5b"
-auto_restart = true
-
-# Фоллбэк — текст в буфер обмена
-[[skill]]
-name = "clipboard"
-triggers = []
-action = "clipboard"
-
-# Заметка в файл
-[[skill]]
-name = "note"
-triggers = ["(создать|создай|запиши|сделай|добавь) заметку"]
-params = [
-  { name = "title", description = "заголовок заметки" },
-  { name = "text", description = "текст заметки" }
-]
-action = "file_append"
-target = "~/Documents/WB/AINotes"
-filename_template = "{{date}}-{{slug}}.md"
-
-# Напоминание (obsidian-reminder формат)
-[[skill]]
-name = "reminder"
-triggers = ["напомни", "поставь напоминание"]
-params = [
-  { name = "task", description = "о чём напомнить" },
-  { name = "date", description = "дата, формат YYYY-MM-DD" },
-  { name = "time", description = "время, формат HH:MM", optional = true }
-]
-action = "reminder"
-target = "~/Documents/WB/AINotes/reminders.md"
-
-# Вопрос Claude (нужен установленный Claude CLI)
-[[skill]]
-name = "ask_claude"
-triggers = ["спроси у клод(а|а)", "задай вопрос клод(у|а)"]
-params = [
-  { name = "query", description = "вопрос или задача для Claude" }
-]
-action = "claude"
-target = "~/Documents/WB/AINotes/claude"
 ```
 
 ## CLI
@@ -121,57 +73,31 @@ isin [OPTIONS]
 
 Опции:
   -f, --file <PATH>        Транскрибация аудиофайла (вместо демона)
-  -m, --model <PATH>       Путь к модели Whisper [default: ggml-large-v3.bin]
+  -m, --model <PATH>       Переопределить путь к модели Whisper
   -l, --language <LANG>    Язык распознавания [default: ru]
   -o, --output <PATH>      Выходной MD-файл (только для --file)
-  -c, --config <PATH>      Путь к конфигу [default: config.toml]
-      --silence-stop <SEC>  Секунд тишины до остановки [default: 3]
-      --min-speech <SEC>    Минимальная длительность речи [default: 3]
-      --list-devices        Показать микрофоны и выйти
+  -c, --config <PATH>      Переопределить путь к конфигу
+      --list-devices       Показать микрофоны и выйти
 ```
 
 ## Структура проекта
 
 ```
 src/
-├── main.rs          # точка входа, daemon loop + file mode
+├── main.rs          # точка входа, daemon loop + file mode + буфер обмена и вставка
 ├── audio.rs         # захват с микрофона (cpal) + декодинг файлов (ffmpeg)
 ├── transcriber.rs   # whisper-rs обёртка
-├── router.rs        # regex-матчинг текста → скилл
-├── llm.rs           # Ollama клиент (extract_params, match_skill, retry)
 ├── config.rs        # парсинг TOML-конфига
-├── hotkey.rs        # глобальный хоткей (rdev)
-├── formatter.rs     # Markdown-форматирование (для --file)
-└── skills/
-    ├── mod.rs       # trait Skill + SkillRegistry
-    ├── clipboard.rs # текст в буфер обмена (pbcopy)
-    ├── file.rs      # file_append: создаёт/дополняет MD-файл
-    ├── reminder.rs  # obsidian-reminder формат
-    └── claude.rs    # вопрос → Claude CLI → ответ в файл
+├── hotkey.rs        # глобальные события Fn (rdev)
+└── formatter.rs     # Markdown-форматирование (для --file)
 ```
 
 ## Требования
 
 - macOS с Apple Silicon (M1/M2/M3/M4)
-- Rust 1.75+
+- Rust 1.90+ (требование `tray-icon`)
+- ffmpeg (для транскрибации файлов)
 - Whisper модель `ggml-large-v3.bin` (~3GB)
-- Ollama с моделью `qwen2.5:1.5b` (для параметризации)
-- Claude CLI (опционально, для скилла «спроси у Клода»)
-
-## Добавление своего скилла
-
-1. Создай файл `src/skills/my_skill.rs` с реализацией `trait Skill`
-2. Зарегистрируй в `src/main.rs`: `registry.register(Box::new(MySkill))`
-3. Опиши в `config.toml`:
-
-```toml
-[[skill]]
-name = "my_skill"
-triggers = ["мой триггер"]
-params = [{ name = "param1", description = "описание параметра" }]
-action = "my_skill"
-target = "..."
-```
 
 ## Лицензия
 

@@ -3,7 +3,7 @@ use std::process::Stdio;
 
 use crate::skills::{Skill, SkillError};
 
-/// Фоллбэк-скилл: копирует распознанный текст в буфер обмена через pbcopy.
+/// Копирует распознанный текст в буфер обмена через pbcopy.
 pub struct ClipboardSkill;
 
 impl Skill for ClipboardSkill {
