@@ -1,6 +1,5 @@
 # Rust
 /target
-Cargo.lock
 
 # Whisper model (large binary)
 *.bin

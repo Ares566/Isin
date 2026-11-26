@@ -2,21 +2,12 @@ mod audio;
 mod config;
 mod formatter;
 mod hotkey;
-mod llm;
-mod router;
-mod skills;
 mod transcriber;
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
 use clap::Parser;
-use skills::claude::ClaudeSkill;
-use skills::clipboard::ClipboardSkill;
-use skills::file::FileAppendSkill;
-use skills::reminder::ReminderSkill;
-use skills::SkillRegistry;
 use transcriber::Transcriber;
 
 #[derive(Parser)]
@@ -28,7 +19,7 @@ struct Cli {
     file: Option<PathBuf>,
 
     /// Путь к модели Whisper (GGML формат)
-    #[arg(short, long, default_value = "ggml-large-v3.bin")]
+    #[arg(short, long, default_value_os_t = default_model_path())]
     model: PathBuf,
 
     /// Язык распознавания
@@ -39,21 +30,43 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Секунд тишины до остановки записи
-    #[arg(long, default_value = "3")]
-    silence_stop: u64,
-
-    /// Минимальная длительность речи до остановки (секунд)
-    #[arg(long, default_value = "3")]
-    min_speech: u64,
-
     /// Показать список микрофонов и выйти
     #[arg(long)]
     list_devices: bool,
 
     /// Путь к конфигурационному файлу
-    #[arg(short, long, default_value = "config.toml")]
+    #[arg(short, long, default_value_os_t = default_config_path())]
     config: PathBuf,
+}
+
+fn default_model_path() -> PathBuf {
+    let local = PathBuf::from("ggml-large-v3.bin");
+    if local.exists() {
+        return local;
+    }
+
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".local/share"))
+        .join("isin/ggml-large-v3.bin")
+}
+
+fn default_config_path() -> PathBuf {
+    let local = PathBuf::from("config.toml");
+    if local.exists() {
+        return local;
+    }
+
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"))
+        .join("isin/config.toml")
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[tokio::main]
@@ -84,7 +97,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Загрузка конфига (необязательный — если нет, работаем без скиллов)
     let cfg = if cli.config.exists() {
         Some(config::Config::load(&cli.config)?)
     } else {
@@ -100,7 +112,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Режим демона
-    daemon_mode(&cli, &cfg, initial_prompt.as_deref()).await
+    daemon_mode(&cli, initial_prompt.as_deref())
 }
 
 /// Транскрибация аудиофайла и запись в Markdown.
@@ -144,79 +156,204 @@ fn file_mode(
     Ok(())
 }
 
-/// Основной цикл демона: ждём хоткей → записываем → транскрибируем → роутер → скилл.
-async fn daemon_mode(
-    cli: &Cli,
-    cfg: &Option<config::Config>,
-    initial_prompt: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Исин запускается...");
-    println!("Загрузка модели {}...", cli.model.display());
-    let t = Transcriber::new(&cli.model, &cli.language, initial_prompt.map(String::from))?;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UiStatus {
+    Idle,
+    Recording,
+    Processing,
+    Success,
+}
 
-    // Инициализация Ollama
-    let mut ollama = cfg.as_ref().and_then(|c| {
-        c.ollama.as_ref().map(|o| llm::OllamaClient::new(&o.url, &o.model, o.auto_restart))
+#[derive(Clone, Copy)]
+enum UiEvent {
+    Status(UiStatus),
+    Exit,
+}
+
+/// Запускает иконку в строке меню и рабочий поток голосового ввода.
+fn daemon_mode(cli: &Cli, initial_prompt: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    const ANIMATION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+    const SUCCESS_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let event_loop = tao::event_loop::EventLoopBuilder::<UiEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+    let model = cli.model.clone();
+    let language = cli.language.clone();
+    let initial_prompt = initial_prompt.map(String::from);
+    let worker_proxy = proxy.clone();
+
+    std::thread::spawn(move || {
+        if let Err(e) = voice_loop(
+            &model,
+            &language,
+            initial_prompt.as_deref(),
+            worker_proxy.clone(),
+        ) {
+            eprintln!("Ошибка: {e}");
+            let _ = worker_proxy.send_event(UiEvent::Exit);
+        }
     });
 
-    if let Some(ref mut client) = ollama {
-        if client.ensure_available().await {
-            println!("Ollama подключена");
-        } else {
-            println!("Ollama недоступна — параметризация через regex");
+    let mut tray: Option<tray_icon::TrayIcon> = None;
+    let mut status = UiStatus::Idle;
+    let mut animation_frame = 0_u64;
+    let mut next_animation = None;
+    let mut success_until = None;
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = tao::event_loop::ControlFlow::Wait;
+        match event {
+            tao::event::Event::NewEvents(tao::event::StartCause::Init) => {
+                match tray_icon::TrayIconBuilder::new()
+                    .with_tooltip(status_tooltip(UiStatus::Idle))
+                    .with_icon(status_icon(UiStatus::Idle, 0))
+                    .build()
+                {
+                    Ok(icon) => tray = Some(icon),
+                    Err(e) => {
+                        eprintln!("Ошибка создания иконки в трее: {e}");
+                        *control_flow = tao::event_loop::ControlFlow::Exit;
+                    }
+                }
+            }
+            tao::event::Event::UserEvent(UiEvent::Status(new_status)) => {
+                status = new_status;
+                animation_frame = 0;
+                next_animation = (status == UiStatus::Processing)
+                    .then(|| std::time::Instant::now() + ANIMATION_INTERVAL);
+                success_until = (status == UiStatus::Success)
+                    .then(|| std::time::Instant::now() + SUCCESS_DURATION);
+                if let Some(icon) = &tray {
+                    update_tray(icon, status, animation_frame);
+                }
+            }
+            tao::event::Event::NewEvents(tao::event::StartCause::ResumeTimeReached { .. }) => {
+                let now = std::time::Instant::now();
+                if status == UiStatus::Processing
+                    && next_animation.is_some_and(|deadline| deadline <= now)
+                {
+                    animation_frame = animation_frame.wrapping_add(1);
+                    next_animation = Some(now + ANIMATION_INTERVAL);
+                    if let Some(icon) = &tray {
+                        if let Err(e) = icon.set_icon(Some(status_icon(status, animation_frame))) {
+                            eprintln!("Ошибка обновления иконки: {e}");
+                        }
+                    }
+                }
+                if status == UiStatus::Success
+                    && success_until.is_some_and(|deadline| deadline <= now)
+                {
+                    status = UiStatus::Idle;
+                    success_until = None;
+                    if let Some(icon) = &tray {
+                        update_tray(icon, status, 0);
+                    }
+                }
+            }
+            tao::event::Event::UserEvent(UiEvent::Exit) => {
+                *control_flow = tao::event_loop::ControlFlow::Exit;
+            }
+            _ => {}
         }
+
+        if !matches!(*control_flow, tao::event_loop::ControlFlow::Exit) {
+            if let Some(deadline) = next_animation.into_iter().chain(success_until).min() {
+                *control_flow = tao::event_loop::ControlFlow::WaitUntil(deadline);
+            }
+        }
+    })
+}
+
+fn update_tray(icon: &tray_icon::TrayIcon, status: UiStatus, animation_frame: u64) {
+    if let Err(e) = icon.set_icon(Some(status_icon(status, animation_frame))) {
+        eprintln!("Ошибка обновления иконки: {e}");
     }
+    if let Err(e) = icon.set_tooltip(Some(status_tooltip(status))) {
+        eprintln!("Ошибка обновления подсказки: {e}");
+    }
+}
 
-    // Реестр скиллов
-    let mut registry = SkillRegistry::new();
-    registry.register(Box::new(ClaudeSkill));
-    registry.register(Box::new(ClipboardSkill));
-    registry.register(Box::new(FileAppendSkill));
-    registry.register(Box::new(ReminderSkill));
-    registry.set_fallback(Box::new(ClipboardSkill));
+fn status_tooltip(status: UiStatus) -> &'static str {
+    match status {
+        UiStatus::Idle => "Исин — удерживайте Fn для записи",
+        UiStatus::Recording => "Исин — идёт запись",
+        UiStatus::Processing => "Исин — распознаёт речь",
+        UiStatus::Success => "Исин — текст распознан",
+    }
+}
 
-    // Навыки из конфига
-    let skills = cfg.as_ref().map(|c| c.skill.clone()).unwrap_or_default();
+/// Основной цикл: удержание Fn → запись → транскрибация → буфер обмена и вставка.
+fn voice_loop(
+    model: &std::path::Path,
+    language: &str,
+    initial_prompt: Option<&str>,
+    proxy: tao::event_loop::EventLoopProxy<UiEvent>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Исин запускается...");
+    println!("Загрузка модели {}...", model.display());
+    let t = Transcriber::new(model, language, initial_prompt.map(String::from))?;
 
-    println!("Запуск слушателя хоткея (Cmd+Shift+Space)...");
+    println!("Запуск слушателя клавиши Fn...");
     let mut hotkey_rx = hotkey::HotkeyListener::new().start()?;
 
-    println!("Исин готов. Нажмите Cmd+Shift+Space для записи.");
+    println!("Исин готов. Удерживайте Fn для записи, отпустите для транскрибации.");
     println!("Ctrl+C — выход.\n");
 
     loop {
-        // Ждём нажатия хоткея
-        hotkey_rx.recv().await;
+        match hotkey_rx.blocking_recv() {
+            Some(hotkey::HotkeyEvent::Pressed) => {}
+            Some(hotkey::HotkeyEvent::Released) => continue,
+            None => return Ok(()),
+        }
 
-        println!("🎤 Запись...");
+        println!("🎤 Запись... Отпустите Fn для завершения.");
         let capture_start = std::time::Instant::now();
 
-        // Захват аудио с микрофона
-        let audio = match audio::capture_live(cli.silence_stop, cli.min_speech) {
-            Ok(data) => data,
+        let capture = match audio::LiveCapture::start() {
+            Ok(capture) => capture,
             Err(e) => {
                 eprintln!("Ошибка захвата аудио: {e}");
                 continue;
             }
         };
+        let _ = proxy.send_event(UiEvent::Status(UiStatus::Recording));
 
+        loop {
+            match hotkey_rx.blocking_recv() {
+                Some(hotkey::HotkeyEvent::Released) => break,
+                Some(hotkey::HotkeyEvent::Pressed) => {}
+                None => return Ok(()),
+            }
+        }
+
+        let audio = capture.stop();
+        let _ = proxy.send_event(UiEvent::Status(UiStatus::Processing));
+        let audio = match audio {
+            Ok(data) => data,
+            Err(e) => {
+                let _ = proxy.send_event(UiEvent::Status(UiStatus::Idle));
+                eprintln!("Ошибка завершения записи: {e}");
+                continue;
+            }
+        };
         let capture_time = capture_start.elapsed();
 
         if audio.is_empty() {
+            let _ = proxy.send_event(UiEvent::Status(UiStatus::Idle));
             println!("  (пусто — нет звука)\n");
             continue;
         }
 
-        // Транскрибация
         let transcribe_start = std::time::Instant::now();
         match t.transcribe(&audio) {
             Ok(text) => {
                 let transcribe_time = transcribe_start.elapsed();
                 if text.trim().is_empty() {
+                    let _ = proxy.send_event(UiEvent::Status(UiStatus::Idle));
                     println!("  (речь не распознана)\n");
                     continue;
                 }
 
+                let _ = proxy.send_event(UiEvent::Status(UiStatus::Success));
                 println!("📝 {text}");
                 println!(
                     "  ⏱ запись {:.1}с + транскрибация {:.1}с",
@@ -224,101 +361,115 @@ async fn daemon_mode(
                     transcribe_time.as_secs_f64()
                 );
 
-                // Роутер: матчим текст против скиллов
-                let matched = router::match_skill(&text, &skills);
-
-                // Если regex не нашёл — пробуем Ollama intent recognition
-                let matched = match matched {
-                    Some(m) => {
-                        let skill = m.skill.clone();
-                        let params = router::extract_params(&text, &m.skill, &ollama).await;
-                        Some((skill, params))
-                    }
-                    None => {
-                        if let Some(ref client) = ollama {
-                            if let Some(intent) = client.match_skill(&text, &skills).await {
-                                println!("  🤔 intent через LLM: {} -> {:?}", intent.skill, intent.params);
-                                // Находим SkillDef по action
-                                if let Some(skill_def) = skills.iter().find(|s| s.action == intent.skill) {
-                                    Some((skill_def.clone(), intent.params))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
+                match copy_to_clipboard(&text) {
+                    Ok(()) => match paste_into_active_app() {
+                        Ok(()) => {
+                            println!("  📋 Скопировано в буфер обмена и вставлено");
+                            notify_transcription_complete(true);
                         }
-                    }
-                };
-
-                if let Some((skill, mut params)) = matched {
-                    // Пробрасываем служебные поля из конфига в параметры
-                    if let Some(ref target) = skill.target {
-                        params.insert("_target".into(), target.clone());
-                    }
-                    if let Some(ref tpl) = skill.filename_template {
-                        params.insert("_filename_template".into(), tpl.clone());
-                    }
-                    // Подставляем текущие дату/время для шаблонов
-                    let now = chrono::Local::now();
-                    params.entry("date".into()).or_insert_with(|| now.format("%Y-%m-%d").to_string());
-                    params.entry("time".into()).or_insert_with(|| now.format("%H:%M").to_string());
-
-                    // Генерируем slug из title для шаблона имени файла
-                    if !params.contains_key("slug") {
-                        let slug = params
-                            .get("title")
-                            .map(|t| slugify(t))
-                            .unwrap_or_default();
-                        params.insert("slug".into(), slug);
-                    }
-
-                    println!("  📋 параметры: {params:?}");
-
-                    if let Some(executor) = registry.get(&skill.action) {
-                        match executor.execute(&text, &params) {
-                            Ok(result) => println!("  ✅ {result}"),
-                            Err(e) => eprintln!("  ❌ {e}"),
+                        Err(e) => {
+                            println!("  📋 Скопировано в буфер обмена");
+                            eprintln!("  ⚠️ Не удалось вставить текст: {e}");
+                            eprintln!(
+                                "     Разрешите терминалу доступ: Конфиденциальность и безопасность → Универсальный доступ"
+                            );
+                            notify_transcription_complete(false);
                         }
-                    } else {
-                        println!("  ⚠️ скилл '{}' не зарегистрирован", skill.action);
-                    }
-                } else {
-                    // Никакой скилл не подошёл — clipboard fallback
-                    if let Some(executor) = registry.get("clipboard") {
-                        let params = HashMap::new();
-                        executor.execute(&text, &params).ok();
-                    }
+                    },
+                    Err(e) => eprintln!("  ❌ Ошибка копирования: {e}"),
                 }
                 println!();
             }
             Err(e) => {
+                let _ = proxy.send_event(UiEvent::Status(UiStatus::Idle));
                 eprintln!("Ошибка транскрибации: {e}\n");
             }
         }
     }
 }
 
-/// Превращает строку в slug: нижний регистр, пробелы → дефисы, убрать спецсимволы.
-fn slugify(s: &str) -> String {
-    s.to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c
-            } else if c == ' ' || c == '-' || c == '_' {
-                '-'
-            } else {
-                '\0'
+fn status_icon(status: UiStatus, animation_frame: u64) -> tray_icon::Icon {
+    const SIZE: u32 = 22;
+    let mut color = match status {
+        UiStatus::Idle => [142, 142, 147, 255],
+        UiStatus::Recording => [255, 59, 48, 255],
+        UiStatus::Processing => [255, 214, 10, 255],
+        UiStatus::Success => [52, 199, 89, 255],
+    };
+    if status == UiStatus::Processing {
+        let pulse = ((animation_frame as f32 * 0.35).sin() + 1.0) / 2.0;
+        let brightness = 0.65 + pulse * 0.35;
+        for channel in &mut color[..3] {
+            *channel = (*channel as f32 * brightness).round() as u8;
+        }
+    }
+    let mut rgba = vec![0; (SIZE * SIZE * 4) as usize];
+    let center = (SIZE as f32 - 1.0) / 2.0;
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            if dx * dx + dy * dy <= 8.0 * 8.0 {
+                let offset = ((y * SIZE + x) * 4) as usize;
+                rgba[offset..offset + 4].copy_from_slice(&color);
             }
-        })
-        .filter(|c| *c != '\0')
-        .collect::<String>()
-        // Схлопываем подряд идущие дефисы
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
+        }
+    }
+
+    tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).expect("размер иконки задан корректно")
+}
+
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "pbcopy завершился со статусом {status}"
+        )))
+    }
+}
+
+fn paste_into_active_app() -> std::io::Result<()> {
+    run_osascript(r#"tell application "System Events" to keystroke "v" using command down"#)
+}
+
+fn run_osascript(script: &str) -> std::io::Result<()> {
+    let output = std::process::Command::new("osascript")
+        .args(["-e", script])
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let details = String::from_utf8_lossy(&output.stderr);
+    let details = details.trim();
+    if details.is_empty() {
+        Err(std::io::Error::other(format!(
+            "osascript завершился со статусом {}",
+            output.status
+        )))
+    } else {
+        Err(std::io::Error::other(details))
+    }
+}
+
+fn notify_transcription_complete(pasted: bool) {
+    let message = if pasted {
+        "Текст скопирован и вставлен"
+    } else {
+        "Текст скопирован в буфер обмена"
+    };
+    let script = format!(r#"display notification "{message}" with title "Исин" sound name "Ping""#);
+    if let Err(e) = run_osascript(&script) {
+        eprintln!("Ошибка системного уведомления: {e}");
+    }
 }

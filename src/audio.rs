@@ -1,7 +1,6 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, StreamConfig};
@@ -9,7 +8,6 @@ use cpal::{Device, SampleFormat, SampleRate, StreamConfig};
 /// Коэффициент программного усиления микрофона.
 /// Встроенные микрофоны macOS часто дают тихий сигнал — усиливаем программно.
 const MIC_GAIN: f32 = 4.0;
-
 
 /// Декодирует аудиофайл в f32 PCM 16kHz mono через ffmpeg.
 pub fn decode_to_pcm_16khz_mono(path: &Path) -> Result<Vec<f32>, AudioError> {
@@ -45,112 +43,62 @@ pub fn decode_to_pcm_16khz_mono(path: &Path) -> Result<Vec<f32>, AudioError> {
     Ok(samples)
 }
 
-/// Захват звука с микрофона с автоматической остановкой по тишине.
-///
-/// Записывает аудио через cpal, конвертирует в 16kHz mono f32
-/// и останавливается когда detected silence длится `silence_stop_secs`.
-pub fn capture_live(silence_stop_secs: u64, min_speech_secs: u64) -> Result<Vec<f32>, AudioError> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or(AudioError::NoDevice)?;
+/// Запись с микрофона, управляемая явным запуском и остановкой.
+pub struct LiveCapture {
+    stream: cpal::Stream,
+    device_rate: u32,
+    buffer: Arc<Mutex<Vec<f32>>>,
+}
 
-    let supported = device
-        .default_input_config()
-        .map_err(AudioError::DeviceConfig)?;
+impl LiveCapture {
+    pub fn start() -> Result<Self, AudioError> {
+        let host = cpal::default_host();
+        let device = host.default_input_device().ok_or(AudioError::NoDevice)?;
 
-    let sample_format = supported.sample_format();
-    let mut config: StreamConfig = supported.config().clone();
-    let channels = config.channels as usize;
+        let supported = device
+            .default_input_config()
+            .map_err(AudioError::DeviceConfig)?;
 
-    // Пытаемся получить 16kHz у устройства
-    if let Some(rate) = select_sample_rate(&device, sample_format, config.channels, 16000) {
-        config.sample_rate = SampleRate(rate);
-    }
+        let sample_format = supported.sample_format();
+        let mut config: StreamConfig = supported.config().clone();
+        let channels = config.channels as usize;
 
-    let device_rate = config.sample_rate.0;
-    let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-
-    // Запуск потока захвата
-    let stream = build_input_stream(&device, &config, sample_format, channels, &buffer)?;
-    stream.play().map_err(AudioError::StreamPlay)?;
-
-    // Цикл ожидания с определением тишины
-    let poll_interval = Duration::from_millis(50);
-    let window_samples = (device_rate as f64 * poll_interval.as_secs_f64()) as usize;
-    let noise_floor_duration = Duration::from_secs(1);
-    let silence_duration = Duration::from_secs(silence_stop_secs.max(1));
-    let min_duration = Duration::from_secs(min_speech_secs);
-
-    let start = std::time::Instant::now();
-    let mut last_sound = start;
-    let mut heard_sound = false;
-
-    // Собираем уровни за первую секунду для калибровки шума
-    let mut calibration_levels: Vec<f32> = Vec::new();
-
-    loop {
-        std::thread::sleep(poll_interval);
-        let elapsed = start.elapsed();
-
-        if let Ok(buf) = buffer.lock() {
-            if !buf.is_empty() {
-                let start_idx = buf.len().saturating_sub(window_samples.max(1));
-                let level = window_level(&buf[start_idx..]);
-
-                // В течение первой секунды собираем уровни для калибровки
-                if elapsed <= noise_floor_duration {
-                    calibration_levels.push(level);
-                }
-
-                // После калибровки: порог = медиана * множитель
-                let threshold = if calibration_levels.len() >= 4 {
-                    let mut sorted = calibration_levels.clone();
-                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let median = sorted[sorted.len() / 2];
-                    (median * 3.0).max(0.003)
-                } else {
-                    0.003
-                };
-
-                let has_sound = level >= threshold;
-
-                if has_sound {
-                    last_sound = std::time::Instant::now();
-                    heard_sound = true;
-                }
-            }
+        if let Some(rate) = select_sample_rate(&device, sample_format, config.channels, 16000) {
+            config.sample_rate = SampleRate(rate);
         }
 
-        // Не слышали речи — таймаут
-        if !heard_sound && elapsed >= silence_duration {
-            break;
+        let device_rate = config.sample_rate.0;
+        let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let stream = build_input_stream(&device, &config, sample_format, channels, &buffer)?;
+        stream.play().map_err(AudioError::StreamPlay)?;
+
+        Ok(Self {
+            stream,
+            device_rate,
+            buffer,
+        })
+    }
+
+    /// Останавливает запись и возвращает PCM 16kHz mono.
+    pub fn stop(self) -> Result<Vec<f32>, AudioError> {
+        drop(self.stream);
+
+        let mut data = self
+            .buffer
+            .lock()
+            .map_err(|_| AudioError::BufferAccess)?
+            .clone();
+
+        if self.device_rate != 16000 && !data.is_empty() {
+            data = resample_linear(&data, self.device_rate, 16000);
         }
 
-        // Минимум речи пройден + тишина — стоп
-        if heard_sound && elapsed >= min_duration && last_sound.elapsed() >= silence_duration {
-            break;
+        if !data.is_empty() {
+            normalize(&mut data);
         }
+
+        Ok(data)
     }
-
-    drop(stream);
-
-    let mut data = buffer
-        .lock()
-        .map_err(|_| AudioError::BufferAccess)?
-        .clone();
-
-    // Resample до 16kHz если устройство выдаёт другую частоту
-    if device_rate != 16000 && !data.is_empty() {
-        data = resample_linear(&data, device_rate, 16000);
-    }
-
-    // Нормализация: приводим пик к 0.9 для чёткого распознавания
-    if !data.is_empty() {
-        normalize(&mut data);
-    }
-
-    Ok(data)
 }
 
 /// Выводит список доступных аудиоустройств ввода.
@@ -200,9 +148,7 @@ fn build_input_stream(
             .build_input_stream(
                 config,
                 move |data: &[u16], _| {
-                    capture_samples(data, channels, &writer, |s| {
-                        (*s as f32 - 32768.0) / 32768.0
-                    });
+                    capture_samples(data, channels, &writer, |s| (*s as f32 - 32768.0) / 32768.0);
                 },
                 |err| eprintln!("ошибка аудио: {err}"),
                 None,
@@ -232,21 +178,9 @@ fn capture_samples<T>(
     }
 }
 
-/// Средний уровень сигнала в окне (RMS).
-fn window_level(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum: f32 = samples.iter().map(|s| s * s).sum();
-    (sum / samples.len() as f32).sqrt()
-}
-
 /// Нормализует аудио: пик приводится к target_peak (0.9).
 fn normalize(samples: &mut [f32]) {
-    let peak = samples
-        .iter()
-        .map(|s| s.abs())
-        .fold(0.0f32, f32::max);
+    let peak = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
     if peak > 1e-6 {
         let scale = 0.9 / peak;
         for s in samples.iter_mut() {
