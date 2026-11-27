@@ -3,3 +3,6 @@
 [whisper]
 # Термины для улучшения распознавания whisper (initial_prompt).
 vocabulary = ["YouTrack", "JetBrains", "Jira", "Notion", "Slack"]
+
+# Минуты простоя до выгрузки модели из памяти. 0 — не выгружать.
+idle_timeout_minutes = 5

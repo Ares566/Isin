@@ -98,13 +98,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let cfg = if cli.config.exists() {
-        Some(config::Config::load(&cli.config)?)
+        config::Config::load(&cli.config)?
     } else {
-        None
+        config::Config::default()
     };
 
     // Формируем initial_prompt из словаря конфига
-    let initial_prompt = cfg.as_ref().and_then(|c| c.whisper_prompt());
+    let initial_prompt = cfg.whisper_prompt();
 
     // Режим файла
     if let Some(ref file_path) = cli.file {
@@ -112,7 +112,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Режим демона
-    daemon_mode(&cli, initial_prompt.as_deref())
+    daemon_mode(&cli, initial_prompt.as_deref(), cfg.idle_timeout_minutes())
 }
 
 /// Транскрибация аудиофайла и запись в Markdown.
@@ -171,12 +171,20 @@ enum UiEvent {
 }
 
 /// Запускает иконку в строке меню и рабочий поток голосового ввода.
-fn daemon_mode(cli: &Cli, initial_prompt: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn daemon_mode(
+    cli: &Cli,
+    initial_prompt: Option<&str>,
+    idle_timeout_minutes: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     const ANIMATION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
     const SUCCESS_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 
     let event_loop = tao::event_loop::EventLoopBuilder::<UiEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let menu_proxy = proxy.clone();
+    tray_icon::menu::MenuEvent::set_event_handler(Some(move |_| {
+        let _ = menu_proxy.send_event(UiEvent::Exit);
+    }));
     let model = cli.model.clone();
     let language = cli.language.clone();
     let initial_prompt = initial_prompt.map(String::from);
@@ -187,6 +195,7 @@ fn daemon_mode(cli: &Cli, initial_prompt: Option<&str>) -> Result<(), Box<dyn st
             &model,
             &language,
             initial_prompt.as_deref(),
+            idle_timeout_minutes,
             worker_proxy.clone(),
         ) {
             eprintln!("Ошибка: {e}");
@@ -203,7 +212,16 @@ fn daemon_mode(cli: &Cli, initial_prompt: Option<&str>) -> Result<(), Box<dyn st
         *control_flow = tao::event_loop::ControlFlow::Wait;
         match event {
             tao::event::Event::NewEvents(tao::event::StartCause::Init) => {
+                let menu = tray_icon::menu::Menu::new();
+                let quit_item = tray_icon::menu::MenuItem::new("Закрыть Исин", true, None);
+                if let Err(e) = menu.append(&quit_item) {
+                    eprintln!("Ошибка создания меню в трее: {e}");
+                    *control_flow = tao::event_loop::ControlFlow::Exit;
+                    return;
+                }
                 match tray_icon::TrayIconBuilder::new()
+                    .with_menu(Box::new(menu))
+                    .with_menu_on_left_click(true)
                     .with_tooltip(status_tooltip(UiStatus::Idle))
                     .with_icon(status_icon(UiStatus::Idle, 0))
                     .build()
@@ -281,28 +299,96 @@ fn status_tooltip(status: UiStatus) -> &'static str {
     }
 }
 
-/// Основной цикл: удержание Fn → запись → транскрибация → буфер обмена и вставка.
+type PendingTranscriber =
+    std::sync::mpsc::Receiver<Result<Transcriber, transcriber::TranscriberError>>;
+
+fn start_transcriber_load(
+    model: &std::path::Path,
+    language: &str,
+    initial_prompt: Option<&str>,
+) -> PendingTranscriber {
+    println!("Загрузка модели {}...", model.display());
+    let model = model.to_path_buf();
+    let language = language.to_owned();
+    let initial_prompt = initial_prompt.map(String::from);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = Transcriber::new(&model, &language, initial_prompt);
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+/// Основной цикл: удержание Fn → запись и фоновая загрузка модели → транскрибация → вставка.
 fn voice_loop(
     model: &std::path::Path,
     language: &str,
     initial_prompt: Option<&str>,
+    idle_timeout_minutes: u64,
     proxy: tao::event_loop::EventLoopProxy<UiEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let model_idle_timeout = (idle_timeout_minutes > 0)
+        .then(|| std::time::Duration::from_secs(idle_timeout_minutes.saturating_mul(60)));
+
     println!("Исин запускается...");
-    println!("Загрузка модели {}...", model.display());
-    let t = Transcriber::new(model, language, initial_prompt.map(String::from))?;
+    println!(
+        "Модель {} будет загружена при первой записи.",
+        model.display()
+    );
 
     println!("Запуск слушателя клавиши Fn...");
-    let mut hotkey_rx = hotkey::HotkeyListener::new().start()?;
+    let hotkey_rx = hotkey::HotkeyListener::new().start()?;
+    let mut transcriber: Option<Transcriber> = None;
+    let mut pending_transcriber: Option<PendingTranscriber> = None;
 
     println!("Исин готов. Удерживайте Fn для записи, отпустите для транскрибации.");
     println!("Ctrl+C — выход.\n");
 
     loop {
-        match hotkey_rx.blocking_recv() {
+        let load_result = pending_transcriber
+            .as_ref()
+            .map(|pending| pending.try_recv());
+        match load_result {
+            Some(Ok(Ok(loaded))) => {
+                transcriber = Some(loaded);
+                pending_transcriber = None;
+                println!("Модель загружена.");
+            }
+            Some(Ok(Err(e))) => {
+                pending_transcriber = None;
+                eprintln!("Ошибка загрузки модели: {e}");
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                pending_transcriber = None;
+                eprintln!("Загрузка модели прервана.");
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+        }
+
+        let event = match model_idle_timeout {
+            Some(timeout) if transcriber.is_some() || pending_transcriber.is_some() => {
+                match hotkey_rx.recv_timeout(timeout) {
+                    Ok(event) => Some(event),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        transcriber = None;
+                        pending_transcriber = None;
+                        println!("Модель выгружена после {idle_timeout_minutes} мин. простоя.\n");
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                }
+            }
+            _ => hotkey_rx.recv().ok(),
+        };
+
+        match event {
             Some(hotkey::HotkeyEvent::Pressed) => {}
             Some(hotkey::HotkeyEvent::Released) => continue,
             None => return Ok(()),
+        }
+
+        if transcriber.is_none() && pending_transcriber.is_none() {
+            pending_transcriber = Some(start_transcriber_load(model, language, initial_prompt));
         }
 
         println!("🎤 Запись... Отпустите Fn для завершения.");
@@ -318,10 +404,10 @@ fn voice_loop(
         let _ = proxy.send_event(UiEvent::Status(UiStatus::Recording));
 
         loop {
-            match hotkey_rx.blocking_recv() {
-                Some(hotkey::HotkeyEvent::Released) => break,
-                Some(hotkey::HotkeyEvent::Pressed) => {}
-                None => return Ok(()),
+            match hotkey_rx.recv() {
+                Ok(hotkey::HotkeyEvent::Released) => break,
+                Ok(hotkey::HotkeyEvent::Pressed) => {}
+                Err(_) => return Ok(()),
             }
         }
 
@@ -342,6 +428,26 @@ fn voice_loop(
             println!("  (пусто — нет звука)\n");
             continue;
         }
+
+        if transcriber.is_none() {
+            let pending = match pending_transcriber.take() {
+                Some(pending) => pending,
+                None => start_transcriber_load(model, language, initial_prompt),
+            };
+            match pending.recv() {
+                Ok(Ok(loaded)) => {
+                    transcriber = Some(loaded);
+                    println!("Модель загружена.");
+                }
+                Ok(Err(e)) => eprintln!("Ошибка загрузки модели: {e}"),
+                Err(_) => eprintln!("Загрузка модели прервана."),
+            }
+        }
+
+        let Some(t) = transcriber.as_ref() else {
+            let _ = proxy.send_event(UiEvent::Status(UiStatus::Idle));
+            continue;
+        };
 
         let transcribe_start = std::time::Instant::now();
         match t.transcribe(&audio) {

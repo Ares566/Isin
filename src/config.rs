@@ -2,10 +2,12 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+const DEFAULT_IDLE_TIMEOUT_MINUTES: u64 = 5;
+
 /// Корневая структура конфигурации.
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
-    /// Настройки whisper: словарь терминов для улучшения распознавания.
+    /// Настройки Whisper и хранения модели в памяти.
     pub whisper: Option<WhisperConfig>,
 }
 
@@ -15,6 +17,13 @@ pub struct WhisperConfig {
     /// Термины для initial_prompt (YouTrack, JetBrains, и т.д.).
     #[serde(default)]
     pub vocabulary: Vec<String>,
+    /// Минуты простоя до выгрузки модели; 0 — не выгружать.
+    #[serde(default = "default_idle_timeout_minutes")]
+    pub idle_timeout_minutes: u64,
+}
+
+fn default_idle_timeout_minutes() -> u64 {
+    DEFAULT_IDLE_TIMEOUT_MINUTES
 }
 
 impl Config {
@@ -25,6 +34,12 @@ impl Config {
         let config: Config =
             toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(config)
+    }
+
+    pub fn idle_timeout_minutes(&self) -> u64 {
+        self.whisper
+            .as_ref()
+            .map_or(DEFAULT_IDLE_TIMEOUT_MINUTES, |w| w.idle_timeout_minutes)
     }
 
     /// Склеивает vocabulary в строку для initial_prompt whisper.
