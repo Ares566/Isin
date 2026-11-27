@@ -1,6 +1,6 @@
 use rdev::{listen, Event, EventType, Key};
+use std::sync::mpsc;
 use std::thread;
-use tokio::sync::mpsc as async_mpsc;
 
 /// Сообщение от слушателя хоткея.
 pub enum HotkeyEvent {
@@ -13,7 +13,7 @@ pub enum HotkeyEvent {
 /// Глобальный слушатель клавиши Fn.
 ///
 /// Запускает отдельный поток для перехвата клавиатурных событий через rdev.
-/// Отправляет HotkeyEvent через tokio mpsc channel.
+/// Отправляет HotkeyEvent через канал стандартной библиотеки.
 pub struct HotkeyListener;
 
 impl HotkeyListener {
@@ -23,9 +23,9 @@ impl HotkeyListener {
 
     /// Запускает слушатель в отдельном потоке.
     ///
-    /// Возвращает tokio mpsc receiver для получения событий нажатия и отпускания Fn.
-    pub fn start(&self) -> Result<async_mpsc::UnboundedReceiver<HotkeyEvent>, HotkeyError> {
-        let (tx, rx) = async_mpsc::unbounded_channel();
+    /// Возвращает receiver для получения событий нажатия и отпускания Fn.
+    pub fn start(&self) -> Result<mpsc::Receiver<HotkeyEvent>, HotkeyError> {
+        let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
             let mut fn_pressed = false;
